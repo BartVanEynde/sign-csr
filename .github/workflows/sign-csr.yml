@@ -12,6 +12,9 @@ concurrency:
   group: sign-csr-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   sign:
     runs-on: ubuntu-latest
@@ -116,5 +119,6 @@ jobs:
             echo "Nothing changed - skipping commit"
           else
             git commit -m "Sign certificate(s) [skip ci]"
+            git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}
             git push
           fi
