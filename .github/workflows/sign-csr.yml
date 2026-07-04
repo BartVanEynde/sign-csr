@@ -1,0 +1,120 @@
+name: Sign CSR (47-day validity)
+
+on:
+  push:
+    paths:
+      - 'sign-server-47/**'
+    branches:
+      - main
+
+# Prevent multiple signing runs from colliding
+concurrency:
+  group: sign-csr-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    # Skip if the commit was made by this bot itself to avoid re-trigger loops
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for CSRs
+        id: check
+        run: |
+          shopt -s nullglob
+          csrs=(sign-server-47/*.csr)
+          if [ -f "sign-server-47/renew-all.txt" ]; then
+            echo "mode=renew" >> $GITHUB_OUTPUT
+            echo "has_work=true" >> $GITHUB_OUTPUT
+          elif [ ${#csrs[@]} -gt 0 ]; then
+            echo "mode=sign" >> $GITHUB_OUTPUT
+            echo "has_work=true" >> $GITHUB_OUTPUT
+          else
+            echo "mode=none" >> $GITHUB_OUTPUT
+            echo "has_work=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install CA key
+        if: steps.check.outputs.has_work == 'true'
+        run: |
+          echo "${{ secrets.CA_KEY }}" > ca/ca.key
+          chmod 600 ca/ca.key
+          # Verify the key matches our CA cert
+          openssl pkey -in ca/ca.key -pubout -outform PEM | diff - <(openssl x509 -in ca/ca.crt -pubkey -noout) || {
+            echo "ERROR: CA_KEY secret does not match ca/ca.crt"
+            exit 1
+          }
+
+      - name: Process CSRs
+        if: steps.check.outputs.has_work == 'true'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          # Helper: sign one CSR
+          sign_csr() {
+            local csr_path="$1"
+            local name
+            name="$(basename "$csr_path" .csr)"
+
+            mkdir -p "certificates/$name"
+            mv "$csr_path" "certificates/$name/$name.csr"
+
+            local end_epoch
+            end_epoch="$(date -d '+47 days' +%s)"
+            local end_date
+            end_date="$(date -d "@$end_epoch" +%Y%m%d)"
+
+            local cert_file="certificates/$name/${end_date}-${name}.pem"
+
+            openssl x509 -req \
+              -in "certificates/$name/$name.csr" \
+              -CA ca/ca.crt \
+              -CAkey ca/ca.key \
+              -CAserial ca/serial \
+              -days 47 \
+              -sha256 \
+              -out "$cert_file"
+
+            echo "  Signed: $name -> ${end_date}-${name}.pem (valid until $end_date)"
+          }
+
+          if [ "sign" = "${{ steps.check.outputs.mode }}" ]; then
+            echo "--- Signing new CSRs ---"
+            for csr in sign-server-47/*.csr; do
+              [ -f "$csr" ] || continue
+              sign_csr "$csr"
+            done
+          fi
+
+          if [ "renew" = "${{ steps.check.outputs.mode }}" ]; then
+            echo "--- Renewing ALL certificates ---"
+            for cert_dir in certificates/*/; do
+              [ -d "$cert_dir" ] || continue
+              local dir_name
+              dir_name="$(basename "${cert_dir%/}")"
+              [ -f "${cert_dir}${dir_name}.csr" ] || continue
+              sign_csr "${cert_dir}${dir_name}.csr"
+            done
+          fi
+
+      - name: Clean up sign-server-47
+        if: steps.check.outputs.has_work == 'true'
+        run: |
+          rm -rf sign-server-47/*
+          touch sign-server-47/.gitkeep
+
+      - name: Commit and push results
+        if: steps.check.outputs.has_work == 'true'
+        run: |
+          git config user.name "CA Bot"
+          git config user.email "ca-bot@sign-csr"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing changed - skipping commit"
+          else
+            git commit -m "Sign certificate(s) [skip ci]"
+            git push
+          fi
